@@ -400,3 +400,1775 @@ plt.tight_layout(); plt.savefig("fig6_test_cm.png", dpi=600); plt.close()
 # Save final model (optional)
 best.save("final_model.h5")
 print("Saved: best_mobilenetv3.keras, final_model.h5, fig6_test_cm.png, fig7_acc.png, fig8_loss.png")
+----------------------------------------------------------------------------------------------------------------------------------------------
+#!/usr/bin/env python3
+import os, random, math, json
+import numpy as np
+import tensorflow as tf
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+
+from tensorflow.keras import layers as L
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.applications.resnet50 import preprocess_input
+from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+
+# ------------------------------------------------------------------
+# Global settings / seeds
+# ------------------------------------------------------------------
+try:
+    tf.config.set_visible_devices([], 'GPU')  # force CPU if needed; remove if you want GPU
+except Exception:
+    pass
+
+SEED = 2025
+tf.keras.utils.set_random_seed(SEED)
+tf.config.experimental.enable_op_determinism()
+
+# ------------------------------------------------------------------
+# Dataset config
+# ------------------------------------------------------------------
+IMAGE_SIZE = 224
+BATCH_SIZE = 32
+EPOCHS = 40
+DATASET_PATH = "potato-dataset"
+
+root = Path(DATASET_PATH)
+classes = sorted([d.name for d in root.iterdir() if d.is_dir()])
+class_to_idx = {c: i for i, c in enumerate(classes)}
+
+files, labels = [], []
+for c in classes:
+    for p in (root / c).glob("*"):
+        if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp", ".webp"]:
+            files.append(str(p))
+            labels.append(class_to_idx[c])
+
+files = np.array(files)
+labels = np.array(labels)
+
+X_train, X_tmp, y_train, y_tmp = train_test_split(
+    files, labels, test_size=0.20, random_state=SEED, stratify=labels
+)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_tmp, y_tmp, test_size=0.50, random_state=SEED, stratify=y_tmp
+)
+
+AUTO = tf.data.AUTOTUNE
+NUM_CLASSES = len(classes)
+
+# ------------------------------------------------------------------
+# tf.data pipeline
+# ------------------------------------------------------------------
+def decode_img(path):
+    x = tf.io.read_file(path)
+    x = tf.io.decode_image(x, channels=3, expand_animations=False)
+    x = tf.image.convert_image_dtype(x, tf.float32)  # [0,1]
+    return x
+
+def make_seed_from_path(path, salt=SEED):
+    h = tf.strings.to_hash_bucket_fast(path, 2**31 - 1)
+    s0 = tf.cast(h, tf.int32)
+    s1 = tf.cast(tf.bitwise.bitwise_xor(h, tf.constant(salt, tf.int32)), tf.int32)
+    return tf.stack([s0, s1])
+
+def stateless_random_resized_crop(img, seed):
+    bbox_begin, bbox_size, _ = tf.image.stateless_sample_distorted_bounding_box(
+        image_size=tf.shape(img),
+        bounding_boxes=tf.zeros([0, 0, 4], tf.float32),
+        seed=seed,
+        min_object_covered=0.0,
+        area_range=(0.8, 1.0),
+        aspect_ratio_range=(0.75, 1.33),
+        use_image_if_no_bounding_boxes=True
+    )
+    crop = tf.slice(img, bbox_begin, bbox_size)
+    crop = tf.image.resize(crop, [IMAGE_SIZE, IMAGE_SIZE], method='bilinear')
+    return crop
+
+def aug_fn(img, path):
+    seed = make_seed_from_path(path)
+    img = stateless_random_resized_crop(img, seed)
+    img = tf.image.stateless_random_flip_left_right(img, seed)
+    img = tf.image.stateless_random_brightness(img, max_delta=0.10, seed=seed)
+    img = tf.image.stateless_random_contrast(img, lower=0.90, upper=1.10, seed=seed)
+    return img
+
+def val_transform(img):
+    return tf.image.resize(img, [IMAGE_SIZE, IMAGE_SIZE], method='bilinear')
+
+def one_hot(y):
+    return tf.one_hot(y, depth=NUM_CLASSES)
+
+def make_ds(paths, labels, training):
+    ds = tf.data.Dataset.from_tensor_slices((paths, labels))
+    if training:
+        ds = ds.shuffle(buffer_size=len(paths), seed=SEED, reshuffle_each_iteration=True)
+
+    def _load(path, y):
+        img = decode_img(path)
+        img = aug_fn(img, path) if training else val_transform(img)
+        return img, one_hot(y)
+
+    ds = ds.map(_load, num_parallel_calls=AUTO).batch(BATCH_SIZE).prefetch(AUTO)
+    return ds
+
+train_ds = make_ds(X_train, y_train, training=True)
+val_ds   = make_ds(X_val,   y_val,   training=False)
+test_ds  = make_ds(X_test,  y_test,  training=False)
+
+# ------------------------------------------------------------------
+# ResNet50 model (Imagenet backbone)
+# ------------------------------------------------------------------
+# We keep inputs in [0,1] from the pipeline and scale to [0,255] + ResNet50 preprocess inside the model.
+inputs = L.Input(shape=(IMAGE_SIZE, IMAGE_SIZE, 3), name="image")
+
+x = L.Lambda(lambda im: preprocess_input(im * 255.0), name="preprocess")(inputs)
+
+base = ResNet50(
+    weights="imagenet",
+    include_top=False,
+    input_tensor=x
+)
+base.trainable = True  # fine-tune entire backbone; freeze if you want
+
+z = base.output
+z = L.GlobalAveragePooling2D()(z)
+z = L.Dropout(0.4)(z)
+out = L.Dense(NUM_CLASSES, activation="softmax", name="predictions")(z)
+
+model = Model(inputs, out, name="resnet50_potato")
+
+model.compile(
+    optimizer=Adam(learning_rate=1e-3),
+    loss="categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+model.summary()
+
+# ------------------------------------------------------------------
+# Training
+# ------------------------------------------------------------------
+ckpt = ModelCheckpoint(
+    "best_resnet50.keras",
+    monitor="val_loss",
+    mode="min",
+    save_best_only=True,
+    verbose=1
+)
+plateau = ReduceLROnPlateau(
+    monitor="val_loss",
+    factor=0.1,
+    patience=5,
+    min_lr=1e-6,
+    verbose=1
+)
+
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    callbacks=[ckpt, plateau],
+    verbose=1
+)
+
+best = tf.keras.models.load_model("best_resnet50.keras")
+
+# ------------------------------------------------------------------
+# Export SavedModel for MapReduce inference
+# ------------------------------------------------------------------
+EXPORT_DIR = "export/resnet50_savedmodel"
+os.makedirs(os.path.dirname(EXPORT_DIR), exist_ok=True)
+tf.saved_model.save(best, EXPORT_DIR)
+print(f"Saved ResNet50 SavedModel to: {EXPORT_DIR}")
+
+# ------------------------------------------------------------------
+# Evaluation on test set  (same style as your MobileNet code)
+# ------------------------------------------------------------------
+y_true_list, y_prob_list = [], []
+for xb, yb in test_ds:
+    pb = best.predict(xb, verbose=0)
+    y_prob_list.append(pb)
+    y_true_list.append(yb.numpy())
+
+y_prob = np.vstack(y_prob_list)
+y_true_oh = np.vstack(y_true_list)
+y_pred = y_prob.argmax(axis=1)
+y_true = y_true_oh.argmax(axis=1)
+
+acc = (y_pred == y_true).mean()
+
+rep = classification_report(y_true, y_pred, target_names=classes, output_dict=True, zero_division=0)
+macro_recall = rep["macro avg"]["recall"]
+macro_f1 = rep["macro avg"]["f1-score"]
+
+cm = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES)))
+
+# macro specificity
+specs = []
+for c in range(NUM_CLASSES):
+    TP = cm[c, c]
+    FN = cm[c, :].sum() - TP
+    FP = cm[:, c].sum() - TP
+    TN = cm.sum() - (TP + FP + FN)
+    specs.append(TN / (TN + FP) if (TN + FP) > 0 else 0.0)
+macro_spec = float(np.mean(specs))
+
+print("\n===== Test metrics (ResNet50) =====")
+print(f"Accuracy: {acc*100:0.2f}%")
+print(f"Macro sensitivity (recall): {macro_recall*100:0.2f}%")
+print(f"Macro specificity: {macro_spec*100:0.2f}%")
+print(f"Macro F1: {macro_f1*100:0.2f}%\n")
+print(classification_report(y_true, y_pred, target_names=classes, zero_division=0))
+
+# ------------------------------------------------------------------
+# Plots (fig7_acc, fig8_loss, fig6_test_cm) same style
+# ------------------------------------------------------------------
+plt.figure(figsize=(7, 4))
+plt.plot(history.history["accuracy"], label="Train", linewidth=2)
+plt.plot(history.history["val_accuracy"], label="Validation", linewidth=2)
+plt.xlabel("Epoch"); plt.ylabel("Accuracy"); plt.legend(frameon=False)
+plt.title("ResNet50 – Training/Validation Accuracy"); plt.tight_layout()
+plt.savefig("fig7_acc_resnet50.png", dpi=600); plt.close()
+
+plt.figure(figsize=(7, 4))
+plt.plot(history.history["loss"], label="Train", linewidth=2)
+plt.plot(history.history["val_loss"], label="Validation", linewidth=2)
+plt.xlabel("Epoch"); plt.ylabel("Cross-entropy loss"); plt.legend(frameon=False)
+plt.title("ResNet50 – Training/Validation Loss"); plt.tight_layout()
+plt.savefig("fig8_loss_resnet50.png", dpi=600); plt.close()
+
+fig, ax = plt.subplots(figsize=(6.5, 5))
+row_pct = (cm.T / np.maximum(cm.sum(1), 1)).T * 100.0
+im = ax.imshow(row_pct, cmap="Blues", vmin=0, vmax=100)
+ax.set_xticks(range(NUM_CLASSES)); ax.set_yticks(range(NUM_CLASSES))
+ax.set_xticklabels(classes, rotation=20)
+ax.set_yticklabels([f"{c} (n={cm[i,:].sum()})" for i, c in enumerate(classes)])
+
+for i in range(NUM_CLASSES):
+    for j in range(NUM_CLASSES):
+        pct = row_pct[i, j]
+        cnt = cm[i, j]
+        if pct > 0.0:
+            ax.text(
+                j, i,
+                f"{cnt}\n({pct:0.1f}%)",
+                ha="center", va="center",
+                color=("white" if pct > 60 else "black"),
+                fontsize=9
+            )
+
+cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+cbar.set_label("Row-normalized (%)")
+ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+ax.set_title("ResNet50 – Test Confusion Matrix")
+plt.tight_layout()
+plt.savefig("fig6_test_cm_resnet50.png", dpi=600); plt.close()
+
+best.save("final_resnet50_model.h5")
+print("Saved: best_resnet50.keras, final_resnet50_model.h5, "
+      "fig6_test_cm_resnet50.png, fig7_acc_resnet50.png, fig8_loss_resnet50.png")
+
+#!/usr/bin/env python3
+import os, sys, json, hashlib
+import numpy as np
+import tensorflow as tf
+
+IMG_SIZE = 224
+K = 3  # number of Test-Time Augmentations
+MODEL_DIR = os.environ.get("MODEL_DIR", "export/resnet50_savedmodel")
+
+# Optional: force CPU (same as your original)
+try:
+    tf.config.set_visible_devices([], 'GPU')
+except Exception:
+    pass
+
+model = tf.saved_model.load(MODEL_DIR)
+infer = model.signatures.get("serving_default", None)
+
+def make_seed(sample_id, salt=2025):
+    h = int(hashlib.md5((sample_id + str(salt)).encode()).hexdigest(), 16)
+    return np.array([h & 0xFFFFFFFF, (h >> 32) & 0xFFFFFFFF], dtype=np.uint32)
+
+def decode(path):
+    x = tf.io.read_file(path)
+    x = tf.io.decode_image(x, channels=3, expand_animations=False)
+    x = tf.image.convert_image_dtype(x, tf.float32)  # [0,1]
+    return x
+
+def stateless_rrc(img, seed):
+    bb0, bb1, _ = tf.image.stateless_sample_distorted_bounding_box(
+        image_size=tf.shape(img),
+        bounding_boxes=tf.zeros([0, 0, 4], tf.float32),
+        seed=tf.convert_to_tensor(seed, tf.int32),
+        min_object_covered=0.0,
+        area_range=(0.8, 1.0),
+        aspect_ratio_range=(0.75, 1.33),
+        use_image_if_no_bounding_boxes=True
+    )
+    crop = tf.slice(img, bb0, bb1)
+    crop = tf.image.resize(crop, [IMG_SIZE, IMG_SIZE], method='bilinear')
+    return crop
+
+def aug(img, seed):
+    img = stateless_rrc(img, seed)
+    img = tf.image.stateless_random_flip_left_right(img, seed)
+    img = tf.image.stateless_random_brightness(img, 0.10, seed)
+    img = tf.image.stateless_random_contrast(img, 0.90, 1.10, seed)
+    return img
+
+def forward(x):
+    if infer is None:
+        return model(x, training=False).numpy()
+    out = infer(tf.constant(x))  # dict of tensors
+    y = list(out.values())[0].numpy()
+    return y
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line or "\t" not in line:
+        continue
+
+    sid, path = line.split("\t", 1)
+    try:
+        img = decode(path)
+        seed = make_seed(sid)
+        logits_sum = None
+
+        for k in range(K):
+            sk = (seed + k) % (2**32)
+            xk = aug(img, sk)
+            xk = tf.expand_dims(xk, 0)  # [1,H,W,3]
+            yk = forward(xk)
+            logits_sum = yk if logits_sum is None else (logits_sum + yk)
+
+        mean_logits = (logits_sum / K).astype(np.float32).ravel().tolist()
+        sys.stdout.write(f"{sid}\t{json.dumps({'logits': mean_logits, 'n': K})}\n")
+
+    except Exception as e:
+        sys.stderr.write(f"WARN\t{sid}\t{e}\n")
+#!/usr/bin/env python3
+import sys, json, math
+
+def softmax(v):
+    m = max(v)
+    ex = [math.exp(x - m) for x in v]
+    s = sum(ex)
+    return [e / s for e in ex]
+
+cur_id = None
+sum_logits = None
+n_total = 0
+
+def flush():
+    global cur_id, sum_logits, n_total
+    if cur_id is None:
+        return
+    mean_logits = [x / max(n_total, 1) for x in sum_logits]
+    probs = softmax(mean_logits)
+    pred = max(range(len(probs)), key=lambda i: probs[i])
+    sys.stdout.write(
+        f"{cur_id}," + ",".join(f"{p:.6f}" for p in probs) + f",{pred}\n"
+    )
+    cur_id = None
+    sum_logits = None
+    n_total = 0
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line or "\t" not in line:
+        continue
+    sid, payload = line.split("\t", 1)
+    obj = json.loads(payload)
+
+    if sid != cur_id:
+        flush()
+        cur_id = sid
+        sum_logits = None
+        n_total = 0
+
+    v = obj["logits"]
+    n = int(obj.get("n", 1))
+
+    if sum_logits is None:
+        sum_logits = [0.0] * len(v)
+    for i, x in enumerate(v):
+        sum_logits[i] += x * n
+
+    n_total += n
+
+flush()
+#!/usr/bin/env bash
+set -euo pipefail
+
+INPUT_LIST=$1      # e.g., HDFS path to "sid<TAB>/path/to/image.jpg"
+OUTPUT_DIR=$2      # e.g., hdfs output dir
+
+hdfs dfs -mkdir -p ${OUTPUT_DIR%/*} || true
+
+hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming*.jar \
+  -D mapreduce.job.name="potato-resnet50-mr-infer" \
+  -D mapreduce.job.reduces=2 \
+  -D mapreduce.map.memory.mb=4096 \
+  -D mapreduce.reduce.memory.mb=4096 \
+  -D mapreduce.map.output.compress=true \
+  -D mapreduce.map.output.compress.codec=org.apache.hadoop.io.compress.Lz4Codec \
+  -D mapreduce.task.io.sort.mb=256 \
+  -D mapreduce.task.io.sort.factor=50 \
+  -D mapreduce.map.speculative=true \
+  -D mapreduce.reduce.speculative=false \
+  -files mapper_infer_resnet50.py,reducer_aggregate.py \
+  -cmdenv MODEL_DIR=export/resnet50_savedmodel \
+  -input "$INPUT_LIST" \
+  -output "$OUTPUT_DIR" \
+  -mapper "python3 mapper_infer_resnet50.py" \
+  -reducer "python3 reducer_aggregate.py"
+------------------------------------------------------------------------------------------------------------------
+#!/usr/bin/env python3
+import os, random, math, json
+import numpy as np
+import tensorflow as tf
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+
+from tensorflow.keras import layers as L
+from tensorflow.keras.applications import ResNet101
+from tensorflow.keras.applications.resnet import preprocess_input
+from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+
+# ------------------------------------------------------------------
+# Global settings / seeds
+# ------------------------------------------------------------------
+try:
+    tf.config.set_visible_devices([], 'GPU')  # remove/comment if you want GPU
+except Exception:
+    pass
+
+SEED = 2025
+tf.keras.utils.set_random_seed(SEED)
+tf.config.experimental.enable_op_determinism()
+
+# ------------------------------------------------------------------
+# Dataset config
+# ------------------------------------------------------------------
+IMAGE_SIZE = 224
+BATCH_SIZE = 32
+EPOCHS = 40
+DATASET_PATH = "potato-dataset"
+
+root = Path(DATASET_PATH)
+classes = sorted([d.name for d in root.iterdir() if d.is_dir()])
+class_to_idx = {c: i for i, c in enumerate(classes)}
+
+files, labels = [], []
+for c in classes:
+    for p in (root / c).glob("*"):
+        if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp", ".webp"]:
+            files.append(str(p))
+            labels.append(class_to_idx[c])
+
+files = np.array(files)
+labels = np.array(labels)
+
+X_train, X_tmp, y_train, y_tmp = train_test_split(
+    files, labels, test_size=0.20, random_state=SEED, stratify=labels
+)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_tmp, y_tmp, test_size=0.50, random_state=SEED, stratify=y_tmp
+)
+
+AUTO = tf.data.AUTOTUNE
+NUM_CLASSES = len(classes)
+
+# ------------------------------------------------------------------
+# tf.data pipeline
+# ------------------------------------------------------------------
+def decode_img(path):
+    x = tf.io.read_file(path)
+    x = tf.io.decode_image(x, channels=3, expand_animations=False)
+    x = tf.image.convert_image_dtype(x, tf.float32)  # [0,1]
+    return x
+
+def make_seed_from_path(path, salt=SEED):
+    h = tf.strings.to_hash_bucket_fast(path, 2**31 - 1)
+    s0 = tf.cast(h, tf.int32)
+    s1 = tf.cast(tf.bitwise.bitwise_xor(h, tf.constant(salt, tf.int32)), tf.int32)
+    return tf.stack([s0, s1])
+
+def stateless_random_resized_crop(img, seed):
+    bbox_begin, bbox_size, _ = tf.image.stateless_sample_distorted_bounding_box(
+        image_size=tf.shape(img),
+        bounding_boxes=tf.zeros([0, 0, 4], tf.float32),
+        seed=seed,
+        min_object_covered=0.0,
+        area_range=(0.8, 1.0),
+        aspect_ratio_range=(0.75, 1.33),
+        use_image_if_no_bounding_boxes=True
+    )
+    crop = tf.slice(img, bbox_begin, bbox_size)
+    crop = tf.image.resize(crop, [IMAGE_SIZE, IMAGE_SIZE], method='bilinear')
+    return crop
+
+def aug_fn(img, path):
+    seed = make_seed_from_path(path)
+    img = stateless_random_resized_crop(img, seed)
+    img = tf.image.stateless_random_flip_left_right(img, seed)
+    img = tf.image.stateless_random_brightness(img, max_delta=0.10, seed=seed)
+    img = tf.image.stateless_random_contrast(img, lower=0.90, upper=1.10, seed=seed)
+    return img
+
+def val_transform(img):
+    return tf.image.resize(img, [IMAGE_SIZE, IMAGE_SIZE], method='bilinear')
+
+def one_hot(y):
+    return tf.one_hot(y, depth=NUM_CLASSES)
+
+def make_ds(paths, labels, training):
+    ds = tf.data.Dataset.from_tensor_slices((paths, labels))
+    if training:
+        ds = ds.shuffle(buffer_size=len(paths), seed=SEED, reshuffle_each_iteration=True)
+
+    def _load(path, y):
+        img = decode_img(path)
+        img = aug_fn(img, path) if training else val_transform(img)
+        return img, one_hot(y)
+
+    ds = ds.map(_load, num_parallel_calls=AUTO).batch(BATCH_SIZE).prefetch(AUTO)
+    return ds
+
+train_ds = make_ds(X_train, y_train, training=True)
+val_ds   = make_ds(X_val,   y_val,   training=False)
+test_ds  = make_ds(X_test,  y_test,  training=False)
+
+# ------------------------------------------------------------------
+# ResNet101 model
+# ------------------------------------------------------------------
+inputs = L.Input(shape=(IMAGE_SIZE, IMAGE_SIZE, 3), name="image")
+
+# scale [0,1] -> [0,255] and apply ResNet preprocessing
+x = L.Lambda(lambda im: preprocess_input(im * 255.0), name="preprocess")(inputs)
+
+base = ResNet101(
+    weights="imagenet",
+    include_top=False,
+    input_tensor=x
+)
+base.trainable = True  # fine-tune all; set False if you want to freeze
+
+z = base.output
+z = L.GlobalAveragePooling2D()(z)
+z = L.Dropout(0.4)(z)
+out = L.Dense(NUM_CLASSES, activation="softmax", name="predictions")(z)
+
+model = Model(inputs, out, name="resnet101_potato")
+
+model.compile(
+    optimizer=Adam(learning_rate=1e-3),
+    loss="categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+model.summary()
+
+# ------------------------------------------------------------------
+# Training
+# ------------------------------------------------------------------
+ckpt = ModelCheckpoint(
+    "best_resnet101.keras",
+    monitor="val_loss",
+    mode="min",
+    save_best_only=True,
+    verbose=1
+)
+plateau = ReduceLROnPlateau(
+    monitor="val_loss",
+    factor=0.1,
+    patience=5,
+    min_lr=1e-6,
+    verbose=1
+)
+
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    callbacks=[ckpt, plateau],
+    verbose=1
+)
+
+best = tf.keras.models.load_model("best_resnet101.keras")
+
+# ------------------------------------------------------------------
+# Export SavedModel for MapReduce inference
+# ------------------------------------------------------------------
+EXPORT_DIR = "export/resnet101_savedmodel"
+os.makedirs(os.path.dirname(EXPORT_DIR), exist_ok=True)
+tf.saved_model.save(best, EXPORT_DIR)
+print(f"Saved ResNet101 SavedModel to: {EXPORT_DIR}")
+
+# ------------------------------------------------------------------
+# Evaluation on test set
+# ------------------------------------------------------------------
+y_true_list, y_prob_list = [], []
+for xb, yb in test_ds:
+    pb = best.predict(xb, verbose=0)
+    y_prob_list.append(pb)
+    y_true_list.append(yb.numpy())
+
+y_prob = np.vstack(y_prob_list)
+y_true_oh = np.vstack(y_true_list)
+y_pred = y_prob.argmax(axis=1)
+y_true = y_true_oh.argmax(axis=1)
+
+acc = (y_pred == y_true).mean()
+
+rep = classification_report(
+    y_true, y_pred, target_names=classes, output_dict=True, zero_division=0
+)
+macro_recall = rep["macro avg"]["recall"]
+macro_f1 = rep["macro avg"]["f1-score"]
+
+cm = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES)))
+
+# macro specificity
+specs = []
+for c in range(NUM_CLASSES):
+    TP = cm[c, c]
+    FN = cm[c, :].sum() - TP
+    FP = cm[:, c].sum() - TP
+    TN = cm.sum() - (TP + FP + FN)
+    specs.append(TN / (TN + FP) if (TN + FP) > 0 else 0.0)
+macro_spec = float(np.mean(specs))
+
+print("\n===== Test metrics (ResNet101) =====")
+print(f"Accuracy: {acc*100:0.2f}%")
+print(f"Macro sensitivity (recall): {macro_recall*100:0.2f}%")
+print(f"Macro specificity: {macro_spec*100:0.2f}%")
+print(f"Macro F1: {macro_f1*100:0.2f}%\n")
+print(classification_report(y_true, y_pred, target_names=classes, zero_division=0))
+
+# ------------------------------------------------------------------
+# Plots (ResNet101 versions)
+# ------------------------------------------------------------------
+plt.figure(figsize=(7, 4))
+plt.plot(history.history["accuracy"], label="Train", linewidth=2)
+plt.plot(history.history["val_accuracy"], label="Validation", linewidth=2)
+plt.xlabel("Epoch"); plt.ylabel("Accuracy"); plt.legend(frameon=False)
+plt.title("ResNet101 – Training/Validation Accuracy"); plt.tight_layout()
+plt.savefig("fig7_acc_resnet101.png", dpi=600); plt.close()
+
+plt.figure(figsize=(7, 4))
+plt.plot(history.history["loss"], label="Train", linewidth=2)
+plt.plot(history.history["val_loss"], label="Validation", linewidth=2)
+plt.xlabel("Epoch"); plt.ylabel("Cross-entropy loss"); plt.legend(frameon=False)
+plt.title("ResNet101 – Training/Validation Loss"); plt.tight_layout()
+plt.savefig("fig8_loss_resnet101.png", dpi=600); plt.close()
+
+fig, ax = plt.subplots(figsize=(6.5, 5))
+row_pct = (cm.T / np.maximum(cm.sum(1), 1)).T * 100.0
+im = ax.imshow(row_pct, cmap="Blues", vmin=0, vmax=100)
+ax.set_xticks(range(NUM_CLASSES)); ax.set_yticks(range(NUM_CLASSES))
+ax.set_xticklabels(classes, rotation=20)
+ax.set_yticklabels([f"{c} (n={cm[i,:].sum()})" for i, c in enumerate(classes)])
+
+for i in range(NUM_CLASSES):
+    for j in range(NUM_CLASSES):
+        pct = row_pct[i, j]
+        cnt = cm[i, j]
+        if pct > 0.0:
+            ax.text(
+                j, i,
+                f"{cnt}\n({pct:0.1f}%)",
+                ha="center", va="center",
+                color=("white" if pct > 60 else "black"),
+                fontsize=9
+            )
+
+cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+cbar.set_label("Row-normalized (%)")
+ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+ax.set_title("ResNet101 – Test Confusion Matrix")
+plt.tight_layout()
+plt.savefig("fig6_test_cm_resnet101.png", dpi=600); plt.close()
+
+best.save("final_resnet101_model.h5")
+print("Saved: best_resnet101.keras, final_resnet101_model.h5, "
+      "fig6_test_cm_resnet101.png, fig7_acc_resnet101.png, fig8_loss_resnet101.png")
+#!/usr/bin/env python3
+import os, sys, json, hashlib
+import numpy as np
+import tensorflow as tf
+
+IMG_SIZE = 224
+K = 3  # number of TTA samples
+MODEL_DIR = os.environ.get("MODEL_DIR", "export/resnet101_savedmodel")
+
+# Optional: force CPU
+try:
+    tf.config.set_visible_devices([], 'GPU')
+except Exception:
+    pass
+
+model = tf.saved_model.load(MODEL_DIR)
+infer = model.signatures.get("serving_default", None)
+
+def make_seed(sample_id, salt=2025):
+    h = int(hashlib.md5((sample_id + str(salt)).encode()).hexdigest(), 16)
+    return np.array([h & 0xFFFFFFFF, (h >> 32) & 0xFFFFFFFF], dtype=np.uint32)
+
+def decode(path):
+    x = tf.io.read_file(path)
+    x = tf.io.decode_image(x, channels=3, expand_animations=False)
+    x = tf.image.convert_image_dtype(x, tf.float32)  # [0,1]
+    return x
+
+def stateless_rrc(img, seed):
+    bb0, bb1, _ = tf.image.stateless_sample_distorted_bounding_box(
+        image_size=tf.shape(img),
+        bounding_boxes=tf.zeros([0, 0, 4], tf.float32),
+        seed=tf.convert_to_tensor(seed, tf.int32),
+        min_object_covered=0.0,
+        area_range=(0.8, 1.0),
+        aspect_ratio_range=(0.75, 1.33),
+        use_image_if_no_bounding_boxes=True
+    )
+    crop = tf.slice(img, bb0, bb1)
+    crop = tf.image.resize(crop, [IMG_SIZE, IMG_SIZE], method='bilinear')
+    return crop
+
+def aug(img, seed):
+    img = stateless_rrc(img, seed)
+    img = tf.image.stateless_random_flip_left_right(img, seed)
+    img = tf.image.stateless_random_brightness(img, 0.10, seed)
+    img = tf.image.stateless_random_contrast(img, 0.90, 1.10, seed)
+    return img
+
+def forward(x):
+    if infer is None:
+        return model(x, training=False).numpy()
+    out = infer(tf.constant(x))  # dict of tensors
+    y = list(out.values())[0].numpy()
+    return y
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line or "\t" not in line:
+        continue
+
+    sid, path = line.split("\t", 1)
+    try:
+        img = decode(path)
+        seed = make_seed(sid)
+        logits_sum = None
+
+        for k in range(K):
+            sk = (seed + k) % (2**32)
+            xk = aug(img, sk)
+            xk = tf.expand_dims(xk, 0)
+            yk = forward(xk)
+            logits_sum = yk if logits_sum is None else (logits_sum + yk)
+
+        mean_logits = (logits_sum / K).astype(np.float32).ravel().tolist()
+        sys.stdout.write(f"{sid}\t{json.dumps({'logits': mean_logits, 'n': K})}\n")
+
+    except Exception as e:
+        sys.stderr.write(f"WARN\t{sid}\t{e}\n")
+#!/usr/bin/env python3
+import sys, json, math
+
+def softmax(v):
+    m = max(v)
+    ex = [math.exp(x - m) for x in v]
+    s = sum(ex)
+    return [e / s for e in ex]
+
+cur_id = None
+sum_logits = None
+n_total = 0
+
+def flush():
+    global cur_id, sum_logits, n_total
+    if cur_id is None:
+        return
+    mean_logits = [x / max(n_total, 1) for x in sum_logits]
+    probs = softmax(mean_logits)
+    pred = max(range(len(probs)), key=lambda i: probs[i])
+    sys.stdout.write(
+        f"{cur_id}," + ",".join(f"{p:.6f}" for p in probs) + f",{pred}\n"
+    )
+    cur_id = None
+    sum_logits = None
+    n_total = 0
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line or "\t" not in line:
+        continue
+    sid, payload = line.split("\t", 1)
+    obj = json.loads(payload)
+
+    if sid != cur_id:
+        flush()
+        cur_id = sid
+        sum_logits = None
+        n_total = 0
+
+    v = obj["logits"]
+    n = int(obj.get("n", 1))
+
+    if sum_logits is None:
+        sum_logits = [0.0] * len(v)
+    for i, x in enumerate(v):
+        sum_logits[i] += x * n
+
+    n_total += n
+
+flush()
+#!/usr/bin/env bash
+set -euo pipefail
+
+INPUT_LIST=$1      # HDFS path to input list: "sid<TAB>/path/to/image.jpg"
+OUTPUT_DIR=$2      # HDFS output directory
+
+hdfs dfs -mkdir -p ${OUTPUT_DIR%/*} || true
+
+hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming*.jar \
+  -D mapreduce.job.name="potato-resnet101-mr-infer" \
+  -D mapreduce.job.reduces=2 \
+  -D mapreduce.map.memory.mb=4096 \
+  -D mapreduce.reduce.memory.mb=4096 \
+  -D mapreduce.map.output.compress=true \
+  -D mapreduce.map.output.compress.codec=org.apache.hadoop.io.compress.Lz4Codec \
+  -D mapreduce.task.io.sort.mb=256 \
+  -D mapreduce.task.io.sort.factor=50 \
+  -D mapreduce.map.speculative=true \
+  -D mapreduce.reduce.speculative=false \
+  -files mapper_infer_resnet101.py,reducer_aggregate.py \
+  -cmdenv MODEL_DIR=export/resnet101_savedmodel \
+  -input "$INPUT_LIST" \
+  -output "$OUTPUT_DIR" \
+  -mapper "python3 mapper_infer_resnet101.py" \
+  -reducer "python3 reducer_aggregate.py"
+-----------------------------------------------------------------------------------------------------------------------------------------------
+#!/usr/bin/env python3
+import os, random, math, json
+import numpy as np
+import tensorflow as tf
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+
+from tensorflow.keras import layers as L
+from tensorflow.keras.applications import DenseNet121
+from tensorflow.keras.applications.densenet import preprocess_input
+from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+
+# ------------------------------------------------------------------
+# Global settings / seeds
+# ------------------------------------------------------------------
+try:
+    tf.config.set_visible_devices([], 'GPU')  # remove/comment if you want GPU
+except Exception:
+    pass
+
+SEED = 2025
+tf.keras.utils.set_random_seed(SEED)
+tf.config.experimental.enable_op_determinism()
+
+# ------------------------------------------------------------------
+# Dataset config
+# ------------------------------------------------------------------
+IMAGE_SIZE = 224
+BATCH_SIZE = 32
+EPOCHS = 40
+DATASET_PATH = "potato-dataset"
+
+root = Path(DATASET_PATH)
+classes = sorted([d.name for d in root.iterdir() if d.is_dir()])
+class_to_idx = {c: i for i, c in enumerate(classes)}
+
+files, labels = [], []
+for c in classes:
+    for p in (root / c).glob("*"):
+        if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp", ".webp"]:
+            files.append(str(p))
+            labels.append(class_to_idx[c])
+
+files = np.array(files)
+labels = np.array(labels)
+
+X_train, X_tmp, y_train, y_tmp = train_test_split(
+    files, labels, test_size=0.20, random_state=SEED, stratify=labels
+)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_tmp, y_tmp, test_size=0.50, random_state=SEED, stratify=y_tmp
+)
+
+AUTO = tf.data.AUTOTUNE
+NUM_CLASSES = len(classes)
+
+# ------------------------------------------------------------------
+# tf.data pipeline
+# ------------------------------------------------------------------
+def decode_img(path):
+    x = tf.io.read_file(path)
+    x = tf.io.decode_image(x, channels=3, expand_animations=False)
+    x = tf.image.convert_image_dtype(x, tf.float32)  # [0,1]
+    return x
+
+def make_seed_from_path(path, salt=SEED):
+    h = tf.strings.to_hash_bucket_fast(path, 2**31 - 1)
+    s0 = tf.cast(h, tf.int32)
+    s1 = tf.cast(tf.bitwise.bitwise_xor(h, tf.constant(salt, tf.int32)), tf.int32)
+    return tf.stack([s0, s1])
+
+def stateless_random_resized_crop(img, seed):
+    bbox_begin, bbox_size, _ = tf.image.stateless_sample_distorted_bounding_box(
+        image_size=tf.shape(img),
+        bounding_boxes=tf.zeros([0, 0, 4], tf.float32),
+        seed=seed,
+        min_object_covered=0.0,
+        area_range=(0.8, 1.0),
+        aspect_ratio_range=(0.75, 1.33),
+        use_image_if_no_bounding_boxes=True
+    )
+    crop = tf.slice(img, bbox_begin, bbox_size)
+    crop = tf.image.resize(crop, [IMAGE_SIZE, IMAGE_SIZE], method='bilinear')
+    return crop
+
+def aug_fn(img, path):
+    seed = make_seed_from_path(path)
+    img = stateless_random_resized_crop(img, seed)
+    img = tf.image.stateless_random_flip_left_right(img, seed)
+    img = tf.image.stateless_random_brightness(img, max_delta=0.10, seed=seed)
+    img = tf.image.stateless_random_contrast(img, lower=0.90, upper=1.10, seed=seed)
+    return img
+
+def val_transform(img):
+    return tf.image.resize(img, [IMAGE_SIZE, IMAGE_SIZE], method='bilinear')
+
+def one_hot(y):
+    return tf.one_hot(y, depth=NUM_CLASSES)
+
+def make_ds(paths, labels, training):
+    ds = tf.data.Dataset.from_tensor_slices((paths, labels))
+    if training:
+        ds = ds.shuffle(buffer_size=len(paths), seed=SEED, reshuffle_each_iteration=True)
+
+    def _load(path, y):
+        img = decode_img(path)
+        img = aug_fn(img, path) if training else val_transform(img)
+        return img, one_hot(y)
+
+    ds = ds.map(_load, num_parallel_calls=AUTO).batch(BATCH_SIZE).prefetch(AUTO)
+    return ds
+
+train_ds = make_ds(X_train, y_train, training=True)
+val_ds   = make_ds(X_val,   y_val,   training=False)
+test_ds  = make_ds(X_test,  y_test,  training=False)
+
+# ------------------------------------------------------------------
+# DenseNet121 model
+# ------------------------------------------------------------------
+inputs = L.Input(shape=(IMAGE_SIZE, IMAGE_SIZE, 3), name="image")
+
+# scale [0,1] -> [0,255] and apply DenseNet preprocessing
+x = L.Lambda(lambda im: preprocess_input(im * 255.0), name="preprocess")(inputs)
+
+base = DenseNet121(
+    weights="imagenet",
+    include_top=False,
+    input_tensor=x
+)
+base.trainable = True  # fine-tune; set False to freeze backbone
+
+z = base.output
+z = L.GlobalAveragePooling2D()(z)
+z = L.Dropout(0.4)(z)
+out = L.Dense(NUM_CLASSES, activation="softmax", name="predictions")(z)
+
+model = Model(inputs, out, name="densenet121_potato")
+
+model.compile(
+    optimizer=Adam(learning_rate=1e-3),
+    loss="categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+model.summary()
+
+# ------------------------------------------------------------------
+# Training
+# ------------------------------------------------------------------
+ckpt = ModelCheckpoint(
+    "best_densenet121.keras",
+    monitor="val_loss",
+    mode="min",
+    save_best_only=True,
+    verbose=1
+)
+plateau = ReduceLROnPlateau(
+    monitor="val_loss",
+    factor=0.1,
+    patience=5,
+    min_lr=1e-6,
+    verbose=1
+)
+
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    callbacks=[ckpt, plateau],
+    verbose=1
+)
+
+best = tf.keras.models.load_model("best_densenet121.keras")
+
+# ------------------------------------------------------------------
+# Export SavedModel for MapReduce inference
+# ------------------------------------------------------------------
+EXPORT_DIR = "export/densenet121_savedmodel"
+os.makedirs(os.path.dirname(EXPORT_DIR), exist_ok=True)
+tf.saved_model.save(best, EXPORT_DIR)
+print(f"Saved DenseNet121 SavedModel to: {EXPORT_DIR}")
+
+# ------------------------------------------------------------------
+# Evaluation on test set
+# ------------------------------------------------------------------
+y_true_list, y_prob_list = [], []
+for xb, yb in test_ds:
+    pb = best.predict(xb, verbose=0)
+    y_prob_list.append(pb)
+    y_true_list.append(yb.numpy())
+
+y_prob = np.vstack(y_prob_list)
+y_true_oh = np.vstack(y_true_list)
+y_pred = y_prob.argmax(axis=1)
+y_true = y_true_oh.argmax(axis=1)
+
+acc = (y_pred == y_true).mean()
+
+rep = classification_report(
+    y_true, y_pred, target_names=classes, output_dict=True, zero_division=0
+)
+macro_recall = rep["macro avg"]["recall"]
+macro_f1 = rep["macro avg"]["f1-score"]
+
+cm = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES)))
+
+# macro specificity
+specs = []
+for c in range(NUM_CLASSES):
+    TP = cm[c, c]
+    FN = cm[c, :].sum() - TP
+    FP = cm[:, c].sum() - TP
+    TN = cm.sum() - (TP + FP + FN)
+    specs.append(TN / (TN + FP) if (TN + FP) > 0 else 0.0)
+macro_spec = float(np.mean(specs))
+
+print("\n===== Test metrics (DenseNet121) =====")
+print(f"Accuracy: {acc*100:0.2f}%")
+print(f"Macro sensitivity (recall): {macro_recall*100:0.2f}%")
+print(f"Macro specificity: {macro_spec*100:0.2f}%")
+print(f"Macro F1: {macro_f1*100:0.2f}%\n")
+print(classification_report(y_true, y_pred, target_names=classes, zero_division=0))
+
+# ------------------------------------------------------------------
+# Plots
+# ------------------------------------------------------------------
+plt.figure(figsize=(7, 4))
+plt.plot(history.history["accuracy"], label="Train", linewidth=2)
+plt.plot(history.history["val_accuracy"], label="Validation", linewidth=2)
+plt.xlabel("Epoch"); plt.ylabel("Accuracy"); plt.legend(frameon=False)
+plt.title("DenseNet121 – Training/Validation Accuracy"); plt.tight_layout()
+plt.savefig("fig7_acc_densenet121.png", dpi=600); plt.close()
+
+plt.figure(figsize=(7, 4))
+plt.plot(history.history["loss"], label="Train", linewidth=2)
+plt.plot(history.history["val_loss"], label="Validation", linewidth=2)
+plt.xlabel("Epoch"); plt.ylabel("Cross-entropy loss"); plt.legend(frameon=False)
+plt.title("DenseNet121 – Training/Validation Loss"); plt.tight_layout()
+plt.savefig("fig8_loss_densenet121.png", dpi=600); plt.close()
+
+fig, ax = plt.subplots(figsize=(6.5, 5))
+row_pct = (cm.T / np.maximum(cm.sum(1), 1)).T * 100.0
+im = ax.imshow(row_pct, cmap="Blues", vmin=0, vmax=100)
+ax.set_xticks(range(NUM_CLASSES)); ax.set_yticks(range(NUM_CLASSES))
+ax.set_xticklabels(classes, rotation=20)
+ax.set_yticklabels([f"{c} (n={cm[i,:].sum()})" for i, c in enumerate(classes)])
+
+for i in range(NUM_CLASSES):
+    for j in range(NUM_CLASSES):
+        pct = row_pct[i, j]
+        cnt = cm[i, j]
+        if pct > 0.0:
+            ax.text(
+                j, i,
+                f"{cnt}\n({pct:0.1f}%)",
+                ha="center", va="center",
+                color=("white" if pct > 60 else "black"),
+                fontsize=9
+            )
+
+cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+cbar.set_label("Row-normalized (%)")
+ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+ax.set_title("DenseNet121 – Test Confusion Matrix")
+plt.tight_layout()
+plt.savefig("fig6_test_cm_densenet121.png", dpi=600); plt.close()
+
+best.save("final_densenet121_model.h5")
+print("Saved: best_densenet121.keras, final_densenet121_model.h5, "
+      "fig6_test_cm_densenet121.png, fig7_acc_densenet121.png, fig8_loss_densenet121.png")
+#!/usr/bin/env python3
+import os, sys, json, hashlib
+import numpy as np
+import tensorflow as tf
+
+IMG_SIZE = 224
+K = 3  # Test-Time Augmentations
+MODEL_DIR = os.environ.get("MODEL_DIR", "export/densenet121_savedmodel")
+
+# Optional: force CPU
+try:
+    tf.config.set_visible_devices([], 'GPU')
+except Exception:
+    pass
+
+model = tf.saved_model.load(MODEL_DIR)
+infer = model.signatures.get("serving_default", None)
+
+def make_seed(sample_id, salt=2025):
+    h = int(hashlib.md5((sample_id + str(salt)).encode()).hexdigest(), 16)
+    return np.array([h & 0xFFFFFFFF, (h >> 32) & 0xFFFFFFFF], dtype=np.uint32)
+
+def decode(path):
+    x = tf.io.read_file(path)
+    x = tf.io.decode_image(x, channels=3, expand_animations=False)
+    x = tf.image.convert_image_dtype(x, tf.float32)  # [0,1]
+    return x
+
+def stateless_rrc(img, seed):
+    bb0, bb1, _ = tf.image.stateless_sample_distorted_bounding_box(
+        image_size=tf.shape(img),
+        bounding_boxes=tf.zeros([0, 0, 4], tf.float32),
+        seed=tf.convert_to_tensor(seed, tf.int32),
+        min_object_covered=0.0,
+        area_range=(0.8, 1.0),
+        aspect_ratio_range=(0.75, 1.33),
+        use_image_if_no_bounding_boxes=True
+    )
+    crop = tf.slice(img, bb0, bb1)
+    crop = tf.image.resize(crop, [IMG_SIZE, IMG_SIZE], method='bilinear')
+    return crop
+
+def aug(img, seed):
+    img = stateless_rrc(img, seed)
+    img = tf.image.stateless_random_flip_left_right(img, seed)
+    img = tf.image.stateless_random_brightness(img, 0.10, seed)
+    img = tf.image.stateless_random_contrast(img, 0.90, 1.10, seed)
+    return img
+
+def forward(x):
+    if infer is None:
+        return model(x, training=False).numpy()
+    out = infer(tf.constant(x))  # dict of tensors
+    y = list(out.values())[0].numpy()
+    return y
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line or "\t" not in line:
+        continue
+
+    sid, path = line.split("\t", 1)
+    try:
+        img = decode(path)
+        seed = make_seed(sid)
+        logits_sum = None
+
+        for k in range(K):
+            sk = (seed + k) % (2**32)
+            xk = aug(img, sk)
+            xk = tf.expand_dims(xk, 0)
+            yk = forward(xk)
+            logits_sum = yk if logits_sum is None else (logits_sum + yk)
+
+        mean_logits = (logits_sum / K).astype(np.float32).ravel().tolist()
+        sys.stdout.write(f"{sid}\t{json.dumps({'logits': mean_logits, 'n': K})}\n")
+
+    except Exception as e:
+        sys.stderr.write(f"WARN\t{sid}\t{e}\n")
+#!/usr/bin/env bash
+set -euo pipefail
+
+INPUT_LIST=$1      # HDFS path: "sid<TAB>/path/to/image.jpg"
+OUTPUT_DIR=$2      # HDFS output directory
+
+hdfs dfs -mkdir -p ${OUTPUT_DIR%/*} || true
+
+hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming*.jar \
+  -D mapreduce.job.name="potato-densenet121-mr-infer" \
+  -D mapreduce.job.reduces=2 \
+  -D mapreduce.map.memory.mb=4096 \
+  -D mapreduce.reduce.memory.mb=4096 \
+  -D mapreduce.map.output.compress=true \
+  -D mapreduce.map.output.compress.codec=org.apache.hadoop.io.compress.Lz4Codec \
+  -D mapreduce.task.io.sort.mb=256 \
+  -D mapreduce.task.io.sort.factor=50 \
+  -D mapreduce.map.speculative=true \
+  -D mapreduce.reduce.speculative=false \
+  -files mapper_infer_densenet121.py,reducer_aggregate.py \
+  -cmdenv MODEL_DIR=export/densenet121_savedmodel \
+  -input "$INPUT_LIST" \
+  -output "$OUTPUT_DIR" \
+  -mapper "python3 mapper_infer_densenet121.py" \
+  -reducer "python3 reducer_aggregate.py"
+--------------------------------------------------------------------------------------------------------------------------------------
+#!/usr/bin/env python3
+import os, random, math, json
+import numpy as np
+import tensorflow as tf
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+
+from tensorflow.keras import layers as L
+from tensorflow.keras.applications import EfficientNetB3
+from tensorflow.keras.applications.efficientnet import preprocess_input
+from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+
+# ------------------------------------------------------------------
+# Global settings / seeds
+# ------------------------------------------------------------------
+try:
+    tf.config.set_visible_devices([], 'GPU')  # remove/comment if you want GPU
+except Exception:
+    pass
+
+SEED = 2025
+tf.keras.utils.set_random_seed(SEED)
+tf.config.experimental.enable_op_determinism()
+
+# ------------------------------------------------------------------
+# Dataset config
+# EfficientNetB3 default size is 300x300
+# ------------------------------------------------------------------
+IMAGE_SIZE = 300
+BATCH_SIZE = 32
+EPOCHS = 40
+DATASET_PATH = "potato-dataset"
+
+root = Path(DATASET_PATH)
+classes = sorted([d.name for d in root.iterdir() if d.is_dir()])
+class_to_idx = {c: i for i, c in enumerate(classes)}
+
+files, labels = [], []
+for c in classes:
+    for p in (root / c).glob("*"):
+        if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp", ".webp"]:
+            files.append(str(p))
+            labels.append(class_to_idx[c])
+
+files = np.array(files)
+labels = np.array(labels)
+
+X_train, X_tmp, y_train, y_tmp = train_test_split(
+    files, labels, test_size=0.20, random_state=SEED, stratify=labels
+)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_tmp, y_tmp, test_size=0.50, random_state=SEED, stratify=y_tmp
+)
+
+AUTO = tf.data.AUTOTUNE
+NUM_CLASSES = len(classes)
+
+# ------------------------------------------------------------------
+# tf.data pipeline
+# ------------------------------------------------------------------
+def decode_img(path):
+    x = tf.io.read_file(path)
+    x = tf.io.decode_image(x, channels=3, expand_animations=False)
+    x = tf.image.convert_image_dtype(x, tf.float32)  # [0,1]
+    return x
+
+def make_seed_from_path(path, salt=SEED):
+    h = tf.strings.to_hash_bucket_fast(path, 2**31 - 1)
+    s0 = tf.cast(h, tf.int32)
+    s1 = tf.cast(tf.bitwise.bitwise_xor(h, tf.constant(salt, tf.int32)), tf.int32)
+    return tf.stack([s0, s1])
+
+def stateless_random_resized_crop(img, seed):
+    bbox_begin, bbox_size, _ = tf.image.stateless_sample_distorted_bounding_box(
+        image_size=tf.shape(img),
+        bounding_boxes=tf.zeros([0, 0, 4], tf.float32),
+        seed=seed,
+        min_object_covered=0.0,
+        area_range=(0.8, 1.0),
+        aspect_ratio_range=(0.75, 1.33),
+        use_image_if_no_bounding_boxes=True
+    )
+    crop = tf.slice(img, bbox_begin, bbox_size)
+    crop = tf.image.resize(crop, [IMAGE_SIZE, IMAGE_SIZE], method='bilinear')
+    return crop
+
+def aug_fn(img, path):
+    seed = make_seed_from_path(path)
+    img = stateless_random_resized_crop(img, seed)
+    img = tf.image.stateless_random_flip_left_right(img, seed)
+    img = tf.image.stateless_random_brightness(img, max_delta=0.10, seed=seed)
+    img = tf.image.stateless_random_contrast(img, lower=0.90, upper=1.10, seed=seed)
+    return img
+
+def val_transform(img):
+    return tf.image.resize(img, [IMAGE_SIZE, IMAGE_SIZE], method='bilinear')
+
+def one_hot(y):
+    return tf.one_hot(y, depth=NUM_CLASSES)
+
+def make_ds(paths, labels, training):
+    ds = tf.data.Dataset.from_tensor_slices((paths, labels))
+    if training:
+        ds = ds.shuffle(buffer_size=len(paths), seed=SEED, reshuffle_each_iteration=True)
+
+    def _load(path, y):
+        img = decode_img(path)
+        img = aug_fn(img, path) if training else val_transform(img)
+        return img, one_hot(y)
+
+    ds = ds.map(_load, num_parallel_calls=AUTO).batch(BATCH_SIZE).prefetch(AUTO)
+    return ds
+
+train_ds = make_ds(X_train, y_train, training=True)
+val_ds   = make_ds(X_val,   y_val,   training=False)
+test_ds  = make_ds(X_test,  y_test,  training=False)
+
+# ------------------------------------------------------------------
+# EfficientNetB3 model
+# ------------------------------------------------------------------
+inputs = L.Input(shape=(IMAGE_SIZE, IMAGE_SIZE, 3), name="image")
+
+# scale [0,1] -> [0,255] then EfficientNet preprocessing
+x = L.Lambda(lambda im: preprocess_input(im * 255.0), name="preprocess")(inputs)
+
+base = EfficientNetB3(
+    weights="imagenet",
+    include_top=False,
+    input_tensor=x
+)
+base.trainable = True  # set False if you want to freeze
+
+z = base.output
+z = L.GlobalAveragePooling2D()(z)
+z = L.Dropout(0.4)(z)
+out = L.Dense(NUM_CLASSES, activation="softmax", name="predictions")(z)
+
+model = Model(inputs, out, name="efficientnetb3_potato")
+
+model.compile(
+    optimizer=Adam(learning_rate=1e-3),
+    loss="categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+model.summary()
+
+# ------------------------------------------------------------------
+# Training
+# ------------------------------------------------------------------
+ckpt = ModelCheckpoint(
+    "best_efficientnetb3.keras",
+    monitor="val_loss",
+    mode="min",
+    save_best_only=True,
+    verbose=1
+)
+plateau = ReduceLROnPlateau(
+    monitor="val_loss",
+    factor=0.1,
+    patience=5,
+    min_lr=1e-6,
+    verbose=1
+)
+
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    callbacks=[ckpt, plateau],
+    verbose=1
+)
+
+best = tf.keras.models.load_model("best_efficientnetb3.keras")
+
+# ------------------------------------------------------------------
+# Export SavedModel for MapReduce inference
+# ------------------------------------------------------------------
+EXPORT_DIR = "export/efficientnetb3_savedmodel"
+os.makedirs(os.path.dirname(EXPORT_DIR), exist_ok=True)
+tf.saved_model.save(best, EXPORT_DIR)
+print(f"Saved EfficientNetB3 SavedModel to: {EXPORT_DIR}")
+
+# ------------------------------------------------------------------
+# Evaluation on test set
+# ------------------------------------------------------------------
+y_true_list, y_prob_list = [], []
+for xb, yb in test_ds:
+    pb = best.predict(xb, verbose=0)
+    y_prob_list.append(pb)
+    y_true_list.append(yb.numpy())
+
+y_prob = np.vstack(y_prob_list)
+y_true_oh = np.vstack(y_true_list)
+y_pred = y_prob.argmax(axis=1)
+y_true = y_true_oh.argmax(axis=1)
+
+acc = (y_pred == y_true).mean()
+
+rep = classification_report(
+    y_true, y_pred, target_names=classes, output_dict=True, zero_division=0
+)
+macro_recall = rep["macro avg"]["recall"]
+macro_f1 = rep["macro avg"]["f1-score"]
+
+cm = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES)))
+
+# macro specificity
+specs = []
+for c in range(NUM_CLASSES):
+    TP = cm[c, c]
+    FN = cm[c, :].sum() - TP
+    FP = cm[:, c].sum() - TP
+    TN = cm.sum() - (TP + FP + FN)
+    specs.append(TN / (TN + FP) if (TN + FP) > 0 else 0.0)
+macro_spec = float(np.mean(specs))
+
+print("\n===== Test metrics (EfficientNetB3) =====")
+print(f"Accuracy: {acc*100:0.2f}%")
+print(f"Macro sensitivity (recall): {macro_recall*100:0.2f}%")
+print(f"Macro specificity: {macro_spec*100:0.2f}%")
+print(f"Macro F1: {macro_f1*100:0.2f}%\n")
+print(classification_report(y_true, y_pred, target_names=classes, zero_division=0))
+
+# ------------------------------------------------------------------
+# Plots
+# ------------------------------------------------------------------
+plt.figure(figsize=(7, 4))
+plt.plot(history.history["accuracy"], label="Train", linewidth=2)
+plt.plot(history.history["val_accuracy"], label="Validation", linewidth=2)
+plt.xlabel("Epoch"); plt.ylabel("Accuracy"); plt.legend(frameon=False)
+plt.title("EfficientNetB3 – Training/Validation Accuracy"); plt.tight_layout()
+plt.savefig("fig7_acc_efficientnetb3.png", dpi=600); plt.close()
+
+plt.figure(figsize=(7, 4))
+plt.plot(history.history["loss"], label="Train", linewidth=2)
+plt.plot(history.history["val_loss"], label="Validation", linewidth=2)
+plt.xlabel("Epoch"); plt.ylabel("Cross-entropy loss"); plt.legend(frameon=False)
+plt.title("EfficientNetB3 – Training/Validation Loss"); plt.tight_layout()
+plt.savefig("fig8_loss_efficientnetb3.png", dpi=600); plt.close()
+
+fig, ax = plt.subplots(figsize=(6.5, 5))
+row_pct = (cm.T / np.maximum(cm.sum(1), 1)).T * 100.0
+im = ax.imshow(row_pct, cmap="Blues", vmin=0, vmax=100)
+ax.set_xticks(range(NUM_CLASSES)); ax.set_yticks(range(NUM_CLASSES))
+ax.set_xticklabels(classes, rotation=20)
+ax.set_yticklabels([f"{c} (n={cm[i,:].sum()})" for i, c in enumerate(classes)])
+
+for i in range(NUM_CLASSES):
+    for j in range(NUM_CLASSES):
+        pct = row_pct[i, j]
+        cnt = cm[i, j]
+        if pct > 0.0:
+            ax.text(
+                j, i,
+                f"{cnt}\n({pct:0.1f}%)",
+                ha="center", va="center",
+                color=("white" if pct > 60 else "black"),
+                fontsize=9
+            )
+
+cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+cbar.set_label("Row-normalized (%)")
+ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+ax.set_title("EfficientNetB3 – Test Confusion Matrix")
+plt.tight_layout()
+plt.savefig("fig6_test_cm_efficientnetb3.png", dpi=600); plt.close()
+
+best.save("final_efficientnetb3_model.h5")
+print("Saved: best_efficientnetb3.keras, final_efficientnetb3_model.h5, "
+      "fig6_test_cm_efficientnetb3.png, fig7_acc_efficientnetb3.png, fig8_loss_efficientnetb3.png")
+#!/usr/bin/env python3
+import os, sys, json, hashlib
+import numpy as np
+import tensorflow as tf
+
+IMG_SIZE = 300
+K = 3  # TTA samples
+MODEL_DIR = os.environ.get("MODEL_DIR", "export/efficientnetb3_savedmodel")
+
+# Optional: force CPU
+try:
+    tf.config.set_visible_devices([], 'GPU')
+except Exception:
+    pass
+
+model = tf.saved_model.load(MODEL_DIR)
+infer = model.signatures.get("serving_default", None)
+
+def make_seed(sample_id, salt=2025):
+    h = int(hashlib.md5((sample_id + str(salt)).encode()).hexdigest(), 16)
+    return np.array([h & 0xFFFFFFFF, (h >> 32) & 0xFFFFFFFF], dtype=np.uint32)
+
+def decode(path):
+    x = tf.io.read_file(path)
+    x = tf.io.decode_image(x, channels=3, expand_animations=False)
+    x = tf.image.convert_image_dtype(x, tf.float32)  # [0,1]
+    return x
+
+def stateless_rrc(img, seed):
+    bb0, bb1, _ = tf.image.stateless_sample_distorted_bounding_box(
+        image_size=tf.shape(img),
+        bounding_boxes=tf.zeros([0, 0, 4], tf.float32),
+        seed=tf.convert_to_tensor(seed, tf.int32),
+        min_object_covered=0.0,
+        area_range=(0.8, 1.0),
+        aspect_ratio_range=(0.75, 1.33),
+        use_image_if_no_bounding_boxes=True
+    )
+    crop = tf.slice(img, bb0, bb1)
+    crop = tf.image.resize(crop, [IMG_SIZE, IMG_SIZE], method='bilinear')
+    return crop
+
+def aug(img, seed):
+    img = stateless_rrc(img, seed)
+    img = tf.image.stateless_random_flip_left_right(img, seed)
+    img = tf.image.stateless_random_brightness(img, 0.10, seed)
+    img = tf.image.stateless_random_contrast(img, 0.90, 1.10, seed)
+    return img
+
+def forward(x):
+    if infer is None:
+        return model(x, training=False).numpy()
+    out = infer(tf.constant(x))  # dict of tensors
+    y = list(out.values())[0].numpy()
+    return y
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line or "\t" not in line:
+        continue
+
+    sid, path = line.split("\t", 1)
+    try:
+        img = decode(path)
+        seed = make_seed(sid)
+        logits_sum = None
+
+        for k in range(K):
+            sk = (seed + k) % (2**32)
+            xk = aug(img, sk)
+            xk = tf.expand_dims(xk, 0)
+            yk = forward(xk)
+            logits_sum = yk if logits_sum is None else (logits_sum + yk)
+
+        mean_logits = (logits_sum / K).astype(np.float32).ravel().tolist()
+        sys.stdout.write(f"{sid}\t{json.dumps({'logits': mean_logits, 'n': K})}\n")
+
+    except Exception as e:
+        sys.stderr.write(f"WARN\t{sid}\t{e}\n")
+#!/usr/bin/env bash
+set -euo pipefail
+
+INPUT_LIST=$1      # HDFS path with "sid<TAB>/path/to/image.jpg"
+OUTPUT_DIR=$2      # HDFS output directory
+
+hdfs dfs -mkdir -p ${OUTPUT_DIR%/*} || true
+
+hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming*.jar \
+  -D mapreduce.job.name="potato-efficientnetb3-mr-infer" \
+  -D mapreduce.job.reduces=2 \
+  -D mapreduce.map.memory.mb=4096 \
+  -D mapreduce.reduce.memory.mb=4096 \
+  -D mapreduce.map.output.compress=true \
+  -D mapreduce.map.output.compress.codec=org.apache.hadoop.io.compress.Lz4Codec \
+  -D mapreduce.task.io.sort.mb=256 \
+  -D mapreduce.task.io.sort.factor=50 \
+  -D mapreduce.map.speculative=true \
+  -D mapreduce.reduce.speculative=false \
+  -files mapper_infer_efficientnetb3.py,reducer_aggregate.py \
+  -cmdenv MODEL_DIR=export/efficientnetb3_savedmodel \
+  -input "$INPUT_LIST" \
+  -output "$OUTPUT_DIR" \
+  -mapper "python3 mapper_infer_efficientnetb3.py" \
+  -reducer "python3 reducer_aggregate.py"
+--------------------------------------------------------------------------------------------------------
+from tensorflow.keras import layers as L
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.applications.regnet import RegNetY040  # RegNetY family
+
+IMAGE_SIZE = 224
+NUM_CLASSES = len(classes)
+EPOCHS = 40
+
+# ---------------- RegNetY backbone (ImageNet pretrained, no top) ----------------
+base = RegNetY040(
+    weights="imagenet",
+    include_top=False,
+    input_shape=(IMAGE_SIZE, IMAGE_SIZE, 3)
+)
+
+base.trainable = True   # fine-tune the whole backbone (you can also freeze some layers if needed)
+
+x = base.output
+x = L.GlobalAveragePooling2D()(x)
+x = L.Dropout(0.4)(x)
+out = L.Dense(NUM_CLASSES, activation="softmax")(x)
+
+regnet_model = Model(base.input, out)
+
+regnet_model.compile(
+    optimizer=Adam(learning_rate=1e-3),
+    loss="categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+ckpt = ModelCheckpoint(
+    "best_regnety040.keras",
+    monitor="val_loss",
+    mode="min",
+    save_best_only=True,
+    verbose=1
+)
+
+plateau = ReduceLROnPlateau(
+    monitor="val_loss",
+    factor=0.1,
+    patience=5,
+    min_lr=1e-6,
+    verbose=1
+)
+
+history = regnet_model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    callbacks=[ckpt, plateau],
+    verbose=1
+)
+
+best = tf.keras.models.load_model("best_regnety040.keras")
+# Export SavedModel for RegNetY
+EXPORT_DIR = "export/regnety040_savedmodel"
+tf.saved_model.save(best, EXPORT_DIR)
+print("Saved RegNetY SavedModel to:", EXPORT_DIR)
+#!/usr/bin/env python3
+import os, sys, json, hashlib, numpy as np, tensorflow as tf
+
+IMG_SIZE = 224
+K = 3
+MODEL_DIR = os.environ.get("MODEL_DIR", "export/regnety040_savedmodel")
+
+model = tf.saved_model.load(MODEL_DIR)
+infer = model.signatures.get("serving_default", None)
+
+def make_seed(sample_id, salt=2025):
+    h = int(hashlib.md5((sample_id+str(salt)).encode()).hexdigest(), 16)
+    return np.array([h & 0xFFFFFFFF, (h >> 32) & 0xFFFFFFFF], dtype=np.uint32)
+
+def decode(path):
+    x = tf.io.read_file(path)
+    x = tf.io.decode_image(x, channels=3, expand_animations=False)
+    x = tf.image.convert_image_dtype(x, tf.float32)
+    return x
+
+def stateless_rrc(img, seed):
+    bb0, bb1, _ = tf.image.stateless_sample_distorted_bounding_box(
+        image_size=tf.shape(img),
+        bounding_boxes=tf.zeros([0,0,4], tf.float32),
+        seed=tf.convert_to_tensor(seed, tf.int32),
+        min_object_covered=0.0,
+        area_range=(0.8,1.0),
+        aspect_ratio_range=(0.75,1.33),
+        use_image_if_no_bounding_boxes=True
+    )
+    crop = tf.slice(img, bb0, bb1)
+    crop = tf.image.resize(crop, [IMG_SIZE, IMG_SIZE], method='bilinear')
+    return crop
+
+def aug(img, seed):
+    img = stateless_rrc(img, seed)
+    img = tf.image.stateless_random_flip_left_right(img, seed)
+    img = tf.image.stateless_random_brightness(img, 0.10, seed)
+    img = tf.image.stateless_random_contrast(img, 0.90, 1.10, seed)
+    return img
+
+def forward(x):
+    if infer is None:
+        return model(x, training=False).numpy()
+    out = infer(tf.constant(x))
+    y = list(out.values())[0].numpy()
+    return y
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line or "\t" not in line:
+        continue
+    sid, path = line.split("\t", 1)
+    try:
+        img = decode(path)
+        seed = make_seed(sid)
+        logits_sum = None
+        for k in range(K):
+            sk = (seed + k) % (2**32)
+            xk = aug(img, sk)
+            xk = tf.expand_dims(xk, 0)
+            yk = forward(xk)
+            logits_sum = yk if logits_sum is None else (logits_sum + yk)
+        mean_logits = (logits_sum / K).astype(np.float32).ravel().tolist()
+        sys.stdout.write(f"{sid}\t{json.dumps({'logits': mean_logits, 'n': K})}\n")
+    except Exception as e:
+        sys.stderr.write(f\"WARN\t{sid}\t{e}\n\")
+#!/usr/bin/env bash
+set -euo pipefail
+
+INPUT_LIST=$1
+OUTPUT_DIR=$2
+
+hdfs dfs -mkdir -p ${OUTPUT_DIR%/*} || true
+
+hadoop jar $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming*.jar \
+  -D mapreduce.job.name="potato-mr-infer-regnety040" \
+  -D mapreduce.job.reduces=2 \
+  -D mapreduce.map.memory.mb=4096 \
+  -D mapreduce.reduce.memory.mb=4096 \
+  -D mapreduce.map.output.compress=true \
+  -D mapreduce.map.output.compress.codec=org.apache.hadoop.io.compress.Lz4Codec \
+  -D mapreduce.task.io.sort.mb=256 \
+  -D mapreduce.task.io.sort.factor=50 \
+  -D mapreduce.map.speculative=true \
+  -D mapreduce.reduce.speculative=false \
+  -files mapper_infer.py,reducer_aggregate.py \
+  -cmdenv MODEL_DIR=export/regnety040_savedmodel \
+  -input "$INPUT_LIST" \
+  -output "$OUTPUT_DIR" \
+  -mapper "python3 mapper_infer.py" \
+  -reducer "python3 reducer_aggregate.py"
